@@ -8,12 +8,13 @@
 //   out        : [B, hidden]           bf16
 //
 // Parallelism (warp-per-output-group, no shared memory):
-//   Each warp owns OUTS_PER_WARP adjacent output dims (h .. h+OUTS_PER_WARP-1)
-//   for one token. One input read `xv` feeds OUTS_PER_WARP independent dot
-//   products, so input-side arithmetic intensity is OUTS_PER_WARP.
+//   Each warp owns a group of adjacent output dimensions for one token.
+//   Input values are reused across the group's independent FP32 dot products.
 //   buffer[token, :, :] fits in L1/L2 (3 KB @ Qwen3-TP8), so no smem staging.
 //
-//   1D grid over (token, h-group). blockDim = 256 (8 warps/CTA).
+//   1D grid over (token, output group). For inter=192, B=1..2 uses
+//   2 outputs/warp and 4 warps/CTA; B=3..16 uses 8 outputs/warp and 2 warps/CTA.
+//   The generic path uses 8 outputs/warp and 8 warps/CTA.
 //
 // Constraints:
 //   * inter  % 64 == 0                    (half_k = inter/2, bf16x2 vec)
@@ -22,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstring>
 
 namespace warp_decode {
 
@@ -29,8 +31,8 @@ constexpr int WARP_SIZE_DOWN       = 32;
 constexpr int WARPS_PER_CTA_DOWN   = 8;
 constexpr int THREADS_PER_CTA_DOWN = WARPS_PER_CTA_DOWN * WARP_SIZE_DOWN;
 
-// Number of output dims each warp computes. Higher = better input reuse, more
-// register pressure. 8 is the sweet spot on H20 for Qwen3 shapes.
+// Output grouping for the generic path. The small-batch path uses two outputs
+// per warp to expose more parallel work and shorten each warp's instruction stream.
 constexpr int OUTS_PER_WARP = 8;
 
 __device__ __forceinline__ float warp_reduce_sum_d(float v) {
@@ -42,7 +44,23 @@ __device__ __forceinline__ float warp_reduce_sum_d(float v) {
     return v;
 }
 
-template<int OUTS>
+template<int STATIC_INTER>
+__device__ __forceinline__ float2 widen_bf16_pair_d(__nv_bfloat162 value) {
+    if constexpr (STATIC_INTER == 192) {
+        // BF16 occupies the high half of FP32: expand both packed operands
+        // directly, before any multiplication, without rounding the product.
+        const __nv_bfloat162_raw raw = static_cast<__nv_bfloat162_raw>(value);
+        uint32_t bits;
+        static_assert(sizeof(raw) == sizeof(bits), "A BF16 pair occupies four bytes");
+        memcpy(&bits, &raw, sizeof(bits));
+        return make_float2(__uint_as_float(bits << 16),
+                          __uint_as_float(bits & 0xffff0000u));
+    } else {
+        return __bfloat1622float2(value);
+    }
+}
+
+template<int OUTS, int STATIC_INTER = 0>
 __global__ void moe_down_3d_batched_kernel(
     const __nv_bfloat16* __restrict__ buffer,     // [B, topk, inter]
     const __nv_bfloat16* __restrict__ W,          // [E, hidden, inter]
@@ -51,6 +69,9 @@ __global__ void moe_down_3d_batched_kernel(
     __nv_bfloat16*       __restrict__ out,        // [B, hidden]
     int B, int E, int topk, int hidden, int inter)
 {
+    // A fixed inter makes all three BF16-pair iterations compile-time known.
+    if constexpr (STATIC_INTER != 0) inter = STATIC_INTER;
+
     const size_t global_tid  = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t global_warp = global_tid / WARP_SIZE_DOWN;
     const int    lane_id     = threadIdx.x & (WARP_SIZE_DOWN - 1);
@@ -96,12 +117,13 @@ __global__ void moe_down_3d_batched_kernel(
         // 32 lanes cover half_k in (half_k/32) iters. For Qwen3 half_k=96 -> 3 iters.
         #pragma unroll
         for (int i = lane_id; i < half_k; i += WARP_SIZE_DOWN) {
-            __nv_bfloat162 xv = in_ptr[i];
+            // Widen before multiplication to avoid rounding each product to BF16.
+            const float2 xf = widen_bf16_pair_d<STATIC_INTER>(in_ptr[i]);
             #pragma unroll
             for (int j = 0; j < OUTS; ++j) {
-                __nv_bfloat162 wv = w_ptrs[j][i];
-                float2 p = __bfloat1622float2(__hmul2(xv, wv));
-                local[j] += p.x + p.y;
+                const float2 wf = widen_bf16_pair_d<STATIC_INTER>(w_ptrs[j][i]);
+                local[j] = fmaf(xf.x, wf.x, local[j]);
+                local[j] = fmaf(xf.y, wf.y, local[j]);
             }
         }
 
@@ -114,9 +136,26 @@ __global__ void moe_down_3d_batched_kernel(
 
     if (lane_id == 0) {
         __nv_bfloat16* out_ptr = out + (size_t)token_id * hidden + h_base;
-        #pragma unroll
-        for (int j = 0; j < OUTS; ++j) {
-            out_ptr[j] = __float2bfloat16(acc[j]);
+        if constexpr (STATIC_INTER == 192 && OUTS == 2) {
+            // Each group starts at an even BF16 index, so this store is aligned.
+            *reinterpret_cast<__nv_bfloat162*>(out_ptr) =
+                __floats2bfloat162_rn(acc[0], acc[1]);
+        } else if constexpr (STATIC_INTER == 192 && OUTS == 8) {
+            const __nv_bfloat162_raw pairs[4] = {
+                static_cast<__nv_bfloat162_raw>(__floats2bfloat162_rn(acc[0], acc[1])),
+                static_cast<__nv_bfloat162_raw>(__floats2bfloat162_rn(acc[2], acc[3])),
+                static_cast<__nv_bfloat162_raw>(__floats2bfloat162_rn(acc[4], acc[5])),
+                static_cast<__nv_bfloat162_raw>(__floats2bfloat162_rn(acc[6], acc[7]))
+            };
+            uint4 packed;
+            static_assert(sizeof(pairs) == sizeof(packed), "Eight BF16 outputs occupy 16 bytes");
+            memcpy(&packed, pairs, sizeof(packed));
+            *reinterpret_cast<uint4*>(out_ptr) = packed;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < OUTS; ++j) {
+                out_ptr[j] = __float2bfloat16(acc[j]);
+            }
         }
     }
 }
@@ -131,6 +170,27 @@ void launch_moe_down_3d_batched(
     cudaStream_t stream)
 {
     const size_t total_warps = (size_t)B * (hidden / OUTS_PER_WARP);
+    if (B > 0 && B <= 16 && inter == 192) {
+        if (B <= 2) {
+            constexpr int SMALL_BATCH_OUTS = 2;
+            constexpr int SMALL_BATCH_WARPS = 4;
+            const size_t small_total_warps = (size_t)B * (hidden / SMALL_BATCH_OUTS);
+            const size_t small_ctas =
+                (small_total_warps + SMALL_BATCH_WARPS - 1) / SMALL_BATCH_WARPS;
+            moe_down_3d_batched_kernel<SMALL_BATCH_OUTS, 192>
+                <<<dim3((unsigned)small_ctas), dim3(SMALL_BATCH_WARPS * WARP_SIZE_DOWN), 0, stream>>>(
+                    buffer, W, topk_ids, topk_scale, out, B, E, topk, hidden, inter);
+        } else {
+            constexpr int SMALL_BATCH_WARPS = 2;
+            const size_t small_ctas =
+                (total_warps + SMALL_BATCH_WARPS - 1) / SMALL_BATCH_WARPS;
+            moe_down_3d_batched_kernel<OUTS_PER_WARP, 192>
+                <<<dim3((unsigned)small_ctas), dim3(SMALL_BATCH_WARPS * WARP_SIZE_DOWN), 0, stream>>>(
+                    buffer, W, topk_ids, topk_scale, out, B, E, topk, hidden, inter);
+        }
+        return;
+    }
+
     const size_t ctas = (total_warps + WARPS_PER_CTA_DOWN - 1) / WARPS_PER_CTA_DOWN;
 
     dim3 grid((unsigned)ctas);
